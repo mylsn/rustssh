@@ -2,7 +2,7 @@
 name = "rustssh"
 version = "0.1.0"
 edition = "2021"
-license = "Apache License 2.0"
+license = "Apache-2.0"
 authors = ["mylsn 358181576@qq.com"]
 description = "ssh tools"
 homepage = "https://github.com/mylsn/rustssh"
