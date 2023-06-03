@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache License 2.0"
 authors = ["mylsn 358181576@qq.com"]
+description = "ssh tools"
+homepage = "https://github.com/mylsn/rustssh"
+documentation = "https://github.com/mylsn/rustssh"
+repository = "https://github.com/mylsn/rustssh"
+readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
