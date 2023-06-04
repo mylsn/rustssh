@@ -7,7 +7,7 @@
 //! ```
 //! # Cargo.toml
 //! [dependencies]
-//! rustssh = "0.1.1"
+//! rustssh = "0.1.2"
 //! ```
 //! 
 //! #### 2. edit code
