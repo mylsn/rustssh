@@ -1,15 +1,52 @@
 use ssh2::{self, Session};
 use std::error::Error;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 // use ssh2::PtyModes;
 
-pub struct Watcher {
+struct Watcher {
     pattern: String,  // 要捕获字符串
     response: String, // 捕获到匹配的字符串出现后, 要输入的内容
     // sentinel: String, // TODO 应答后返回的信息与之匹配, 说明应答失败. 还未实现
-    to_upper: bool, // 是否将捕获的字符串和要匹配的字符串全转换成大写再进行比较
+    case_sensitive: bool, // 是否区别大小写
+}
+
+pub struct RunOptions {
+    watchers: Vec<Watcher>,
+}
+
+impl RunOptions {
+    pub fn new() -> RunOptions {
+        RunOptions { watchers: Vec::new() }
+    }
+
+    pub fn set_watcher(&mut self, pattern: &str, response: &str, case_sensitive: bool) {
+        self.watchers.push(Watcher { pattern: pattern.to_string(), response: response.to_string(), case_sensitive });
+    }
+}
+
+pub struct SudoOptions {
+    sudo_user: String,
+    sudo_password: String,
+    sudo_pattern: String,
+    run: RunOptions,
+}
+
+impl SudoOptions {
+    pub fn new(sudo_user: &str, sudo_password: &str, sudo_pattern: &str) -> SudoOptions {
+        SudoOptions {
+            sudo_user: sudo_user.to_string(),
+            sudo_password: sudo_password.to_string(),
+            sudo_pattern: sudo_pattern.to_string(),
+            run: RunOptions { watchers: Vec::new() },
+        }
+    }
+
+    pub fn set_watcher(&mut self, pattern: &str, response: &str, case_sensitive: bool) {
+        self.run.watchers.push(Watcher { pattern: pattern.to_string(), response: response.to_string(), case_sensitive });
+    }
 }
 
 pub enum Auth {
@@ -18,23 +55,27 @@ pub enum Auth {
     Privatekeyfile(String),
 }
 
-pub struct Connection<'a> {
-    host: String,
-    port: i32,
-    user: &'a str,
-    auth: &'a Auth,
-    timeout: u32,
-    session: ssh2::Session,
-    watchers: Vec<Watcher>,
+impl Clone for Auth {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Password(arg0) => Self::Password(arg0.clone()),
+            Self::Privatekey(arg0) => Self::Privatekey(arg0.clone()),
+            Self::Privatekeyfile(arg0) => Self::Privatekeyfile(arg0.clone()),
+        }
+    }
 }
 
-impl<'a> Connection<'a> {
-    pub fn new(
-        host: String,
-        port: i32,
-        user: &'a str,
-        auth: &'a Auth,
-    ) -> Result<Connection<'a>, Box<dyn Error>> {
+pub struct Connection {
+    host: String,
+    port: u16,
+    user: String,
+    auth: Auth,
+    timeout: u32,
+    session: Session,
+}
+
+impl Connection {
+    pub fn new(host: String, port: u16, user: String, auth: Auth) -> Result<Connection, Box<dyn Error>> {
         let timeout: u32 = 60000;
 
         let addr = format!("{}:{}", host, port);
@@ -52,52 +93,50 @@ impl<'a> Connection<'a> {
             auth,
             timeout,
             session,
-            watchers: Vec::new(),
         };
-
-        conn.authenticated(user, auth)?;
+        conn.authenticated()?;
+        conn.session.authenticated();
 
         Ok(conn)
     }
 
-    pub fn auth_config(&mut self, user: &str, auth: &Auth) -> Result<(), ssh2::Error> {
-        match auth {
-            Auth::Password(password) => self.session.userauth_password(user, &password),
-            Auth::Privatekey(privatekey) => {
-                self.session
-                    .userauth_pubkey_memory(user, None, &privatekey, None)
-            }
+    fn authenticated(&mut self) -> Result<(), ssh2::Error> {
+        match &self.auth {
+            Auth::Password(password) => self.session.userauth_password(&self.user, &password),
+            Auth::Privatekey(privatekey) => self.session.userauth_pubkey_memory(&self.user, None, &privatekey, None),
             Auth::Privatekeyfile(privatekey_file) => {
                 let privatekey_path = Path::new(&privatekey_file);
-                self.session
-                    .userauth_pubkey_file(user, None, privatekey_path, None)
+                self.session.userauth_pubkey_file(&self.user, None, privatekey_path, None)
             }
         }
     }
 
-    pub fn authenticated(&mut self, user: &str, auth: &Auth) -> Result<(), ssh2::Error> {
-        self.auth_config(user, auth)?;
-        self.session.authenticated();  // TODO: 这里返回了 bool, 需要处理 false 的情况
-        Ok(())
+    pub fn get_host(&mut self) -> String {
+        self.host.to_string()
+    }
+
+    pub fn get_port(&mut self) -> u16 {
+        self.port
+    }
+
+    pub fn get_user(&mut self) -> String {
+        self.user.to_string()
+    }
+
+    pub fn get_auth(&mut self) -> Auth {
+        self.auth.clone()
+    }
+
+    pub fn get_timeout(&mut self) -> u32 {
+        self.timeout
     }
 
     pub fn set_timeout(&mut self, timeout: u32) {
-        self.timeout = timeout
+        self.timeout = timeout;
+        self.session.set_timeout(self.timeout);
     }
 
-    pub fn set_watcher(&mut self, pattern: String, response: String, to_upper: bool) {
-        self.watchers.push(Watcher {
-            pattern,
-            response,
-            to_upper,
-        });
-    }
-
-    fn run_watcher(
-        &mut self,
-        channel: &mut ssh2::Channel,
-        stdout: &mut Vec<u8>,
-    ) -> Result<(), Box<dyn Error>> {
+    fn run_watcher(&mut self, channel: &mut ssh2::Channel, watchers: Vec<Watcher>, stdout: &mut Vec<u8>) -> Result<(), Box<dyn Error>> {
         loop {
             let mut buf = [0; 1024];
 
@@ -111,58 +150,27 @@ impl<'a> Connection<'a> {
 
             let s = String::from_utf8_lossy(slice);
 
-            for w in self.watchers.iter() {
-                if w.to_upper {
+            for w in watchers.iter() {
+                if w.case_sensitive {
+                    if s.contains(&w.pattern) {
+                        channel.write_all(format!("{}\n", w.response).as_bytes())?;
+                        channel.flush()?;
+                    }
+                    
+                } else {
                     if s.to_uppercase().contains(&w.pattern.to_uppercase()) {
                         channel.write_all(format!("{}\n", w.response).as_bytes())?;
                         channel.flush()?;
                     }
-                } else {
-                    if w.to_upper {
-                        if s.contains(&w.pattern) {
-                            channel.write_all(format!("{}\n", w.response).as_bytes())?;
-                            channel.flush()?;
-                        }
-                    }
                 }
             }
-
-            // match self.channel.read(&mut buf) {
-            //     Err(e) => e,
-            //     // the channel has closed and we got an EOF
-            //     Ok(0) => Ok(()),
-            //     // We got some data; try to decode it as utf-8
-            //     Ok(n) => {
-            //         let slice = &buf[0..n];
-            //         stdout.extend_from_slice(slice);
-
-            //         match std::str::from_utf8(slice) {
-            //             Err(e) => e,
-            //             Ok(s) => {
-            //                 for w in self.watchers.iter() {
-            //                     if w.to_upper {
-            //                         if s.to_uppercase(). contains(w.pattern.to_uppercase()) {
-            //                             channel                                            .write_all(format!("{}\n", w.response).as_bytes())?;
-            //                             channel.flush()?;
-            //                         }
-            //                     } else {
-            //                         if w.to_upper {
-            //                             if s..contains(w.pattern) {
-            //                                 channel
-            //                                     .write_all(format!("{}\n", w.response).as_bytes())?;
-            //                                 channel.flush()?;
-            //                             }
-            //                     }
-            //                 }
-            //             }
-            //         }
-            //     }
-            // }
         }
         Ok(())
     }
 
-    pub fn run(&mut self, cmd: &str) -> Result<(String, String), Box<dyn Error>> {
+    pub fn run_with_options(&mut self, cmd: &str, options: Option<RunOptions>) -> Result<(String, String, i32), Box<dyn Error>> {
+        let command = format!("PATH=$PATH:/usr/bin:/usr/sbin {}", cmd);
+
         let mut channel = self.session.channel_session()?;
 
         // let mut modes = PtyModes::new();
@@ -173,31 +181,83 @@ impl<'a> Connection<'a> {
         // channel.request_pty("xterm", Some(modes),Some((80, 40, 0, 0))).unwrap();
 
         channel.handle_extended_data(ssh2::ExtendedData::Merge)?;
-        channel.exec(cmd)?;
+        channel.exec(&command)?;
 
         let mut stdout = Vec::new();
-        if self.watchers.len() != 0 {
-            self.run_watcher(&mut channel, &mut stdout)?
+
+        match options {
+            Some(opt) => {
+                if opt.watchers.len() != 0 {
+                    self.run_watcher(&mut channel, opt.watchers, &mut stdout)?
+                }
+            }
+            None => (),
         }
 
-        let mut data = String::from_utf8_lossy(&stdout);
+        let mut stdout = String::from_utf8_lossy(&stdout);
 
+        // 对于没有 watchers 的情况, 需要在这里读取输出内容
         let mut out = String::new();
         channel.read_to_string(&mut out)?;
-        data.to_mut().push_str(&out);
-        
-        // let mut err = String::new();
-        // channel.stderr().read_to_string(&mut err).unwrap();
-        
-        channel.wait_close().unwrap();
-        
+        stdout.to_mut().push_str(&out);
+
         let mut stderr = String::new();
+        channel.stderr().read_to_string(&mut stderr).unwrap();
+
+        channel.wait_close().unwrap();
+
         let status: i32 = channel.exit_status()?;
-        if status != 0 {
-            stderr = "Incorrect status code".to_string();
+
+        Ok((stdout.to_string(), stderr.to_string(), status))
+    }
+
+    pub fn sudo_with_options(&mut self, cmd: &str, options: Option<SudoOptions>) -> Result<(String, String, i32), Box<dyn Error>> {
+
+        let mut opt = match options {
+            Some(options) => options,
+            None => SudoOptions::new("root", "", "[sudo] password:"),
+        };
+
+        if opt.sudo_user == "" {
+            opt.sudo_user = "root".to_string();
+        }
+    
+        if opt.sudo_password == "" {
+            match self.get_auth() {
+                Auth::Password(pwd) => opt.sudo_password = pwd.to_string(),
+                Auth::Privatekey(_) => {},
+                Auth::Privatekeyfile(_) => {},
+            }
+        }
+    
+        if opt.sudo_pattern == "" {
+            opt.sudo_pattern = "[sudo] password:".to_string()
         }
 
-        Ok((data.to_string(), stderr))
+        opt.set_watcher(&opt.sudo_pattern.clone(), &opt.sudo_password.clone(), true);
+
+        let cmd = format!("sudo -S -p '{}' -H -u {} /bin/bash -l -c \"cd; {}\"", opt.sudo_pattern, opt.sudo_user, cmd);
+
+        self.run_with_options(&cmd, Some(opt.run))
+
+    }
+
+    pub fn run(&mut self, cmd: &str) -> Result<(String, String, i32), Box<dyn Error>> {
+        self.run_with_options(cmd, None)
+    }
+
+    pub fn sudo(&mut self, cmd: &str) -> Result<(String, String, i32), Box<dyn Error>> {
+        self.sudo_with_options(cmd, None)
+    }
+
+    pub fn scp(&mut self, source: &str, target: &str) -> Result<(), Box<dyn Error>> {
+        // 上传文件
+        let source_file = fs::read(source)?;
+        let mut target_file = self.session.scp_send(Path::new(&target), 0o755, source_file.len() as u64, None)?;
+
+        target_file.write(&source_file)?;
+
+        Ok(())
     }
 }
 
@@ -209,16 +269,21 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let myhost = env::var("MYHOST").expect("$HOME is not defined");
-        let myport = env::var("MYPORT").expect("$HOME is not defined");
-        let myusername = env::var("MYUSERNAME").expect("$HOME is not defined");
-        let mypassword = env::var("MYPASSWORD").expect("$HOME is not defined");
+        let myhost = env::var("MYHOST").expect("$MYHOST is not defined");
+        let myport = env::var("MYPORT").expect("$MYPORT is not defined");
+        let myusername = env::var("MYUSERNAME").expect("$MYUSERNAME is not defined");
+        let mypassword = env::var("MYPASSWORD").expect("$MYPASSWORD is not defined");
 
-        let port: i32 = myport.parse().unwrap();
+        let port: u16 = myport.parse().unwrap();
 
-        let binding = Auth::Password(mypassword);
-        let mut conn = Connection::new(myhost, port, &myusername, &binding).unwrap();
-        let (s1, s2) = conn.run("ls").unwrap();
-        println!("{}, {}", s1, s2);
+        let mut conn = Connection::new(myhost, port, myusername, Auth::Password(mypassword)).unwrap();
+
+        let (stdout, stderr, status) = conn.run("ls").unwrap();
+        println!("最后的输出内容为: {}, 错误输出为: {}, 状态码为: {}, 结束了", stdout, stderr, status);
+
+        let (stdout, stderr, status) = conn.sudo("ls -l /root/").unwrap();
+        println!("最后的输出内容为: {}, 错误输出为: {}, 状态码为: {}, 结束了", stdout, stderr, status);
+
+        conn.scp("/home/liusainan/x.xml", "/home/dm8/xx.xml").unwrap();
     }
 }
